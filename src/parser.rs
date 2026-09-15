@@ -227,3 +227,193 @@ fn parse_number(s: &str, lenient: bool) -> Result<u32, ParseError> {
     }
     s.parse::<u32>().map_err(|_| ParseError::BadNumber(s.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dice_terms(expr: &Expr) -> Vec<(Sign, u32, u32)> {
+        expr.terms
+            .iter()
+            .map(|t| match t.kind {
+                TermKind::Dice { count, sides } => (t.sign, count, sides),
+                TermKind::Flat(_) => panic!("expected a dice term"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parses_single_die() {
+        let expr = parse("1d20", false).unwrap();
+        assert_eq!(dice_terms(&expr), vec![(Sign::Plus, 1, 20)]);
+    }
+
+    #[test]
+    fn parses_dice_plus_flat_modifier() {
+        let expr = parse("2d6+3", false).unwrap();
+        assert_eq!(expr.terms.len(), 2);
+        match expr.terms[1].kind {
+            TermKind::Flat(v) => assert_eq!(v, 3),
+            _ => panic!("expected a flat term"),
+        }
+    }
+
+    #[test]
+    fn parses_mixed_signed_terms() {
+        let expr = parse("2d6-1d4", false).unwrap();
+        assert_eq!(
+            dice_terms(&expr),
+            vec![(Sign::Plus, 2, 6), (Sign::Minus, 1, 4)]
+        );
+    }
+
+    #[test]
+    fn empty_input_is_rejected() {
+        assert!(matches!(parse("", false), Err(ParseError::Empty)));
+    }
+
+    #[test]
+    fn strict_mode_rejects_whitespace() {
+        assert!(matches!(
+            parse("2d6 + 3", false),
+            Err(ParseError::Whitespace(3))
+        ));
+    }
+
+    #[test]
+    fn lenient_mode_strips_whitespace() {
+        let expr = parse("2d6 + 3", true).unwrap();
+        assert_eq!(expr.terms.len(), 2);
+    }
+
+    #[test]
+    fn strict_mode_rejects_uppercase_d() {
+        assert!(matches!(
+            parse("2D6", false),
+            Err(ParseError::UppercaseD(1))
+        ));
+    }
+
+    #[test]
+    fn lenient_mode_accepts_uppercase_d() {
+        let expr = parse("2D6", true).unwrap();
+        assert_eq!(dice_terms(&expr), vec![(Sign::Plus, 2, 6)]);
+    }
+
+    #[test]
+    fn strict_mode_rejects_leading_zero() {
+        assert!(matches!(
+            parse("02d6", false),
+            Err(ParseError::LeadingZero(_))
+        ));
+    }
+
+    #[test]
+    fn lenient_mode_accepts_leading_zero() {
+        let expr = parse("02d6", true).unwrap();
+        assert_eq!(dice_terms(&expr), vec![(Sign::Plus, 2, 6)]);
+    }
+
+    #[test]
+    fn strict_mode_rejects_omitted_count() {
+        assert!(matches!(
+            parse("d6", false),
+            Err(ParseError::BadNumber(_))
+        ));
+    }
+
+    #[test]
+    fn lenient_mode_defaults_omitted_count_to_one() {
+        let expr = parse("d6", true).unwrap();
+        assert_eq!(dice_terms(&expr), vec![(Sign::Plus, 1, 6)]);
+    }
+
+    #[test]
+    fn adjacent_terms_without_a_sign_merge_into_one_bad_token() {
+        // There's no separator between "1d6" and "1d4" here, so the
+        // tokenizer (which only splits on '+'/'-') treats the whole
+        // thing as a single term and fails parsing its side count.
+        assert!(matches!(
+            parse("1d61d4", false),
+            Err(ParseError::BadNumber(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_trailing_operator() {
+        assert!(matches!(parse("1d6+", false), Err(ParseError::EmptyTerm(4))));
+    }
+
+    #[test]
+    fn rejects_missing_sides() {
+        assert!(matches!(
+            parse("2d", false),
+            Err(ParseError::MissingSides(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_count() {
+        assert!(matches!(parse("0d6", false), Err(ParseError::ZeroCount(_))));
+    }
+
+    #[test]
+    fn rejects_zero_sides() {
+        assert!(matches!(parse("1d0", false), Err(ParseError::ZeroSides(_))));
+    }
+
+    #[test]
+    fn rejects_non_numeric_token() {
+        assert!(matches!(parse("abc", false), Err(ParseError::BadNumber(_))));
+    }
+
+    #[test]
+    fn rejects_sides_over_limit() {
+        assert!(matches!(
+            parse("1d1001", false),
+            Err(ParseError::TooManySides(1001))
+        ));
+    }
+
+    #[test]
+    fn accepts_sides_at_limit() {
+        assert!(parse("1d1000", false).is_ok());
+    }
+
+    #[test]
+    fn rejects_total_dice_over_limit() {
+        assert!(matches!(
+            parse("501d6", false),
+            Err(ParseError::TooManyDice(501))
+        ));
+    }
+
+    #[test]
+    fn accepts_total_dice_at_limit_across_terms() {
+        assert!(parse("250d6+250d4", false).is_ok());
+    }
+
+    #[test]
+    fn rejects_too_many_terms() {
+        let expr = (0..33).map(|_| "1d6").collect::<Vec<_>>().join("+");
+        assert!(matches!(
+            parse(&expr, false),
+            Err(ParseError::TooManyTerms(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_terms_at_limit() {
+        let expr = (0..32).map(|_| "1d6").collect::<Vec<_>>().join("+");
+        assert!(parse(&expr, false).is_ok());
+    }
+
+    #[test]
+    fn bare_number_is_a_flat_term() {
+        let expr = parse("5", false).unwrap();
+        match expr.terms[0].kind {
+            TermKind::Flat(v) => assert_eq!(v, 5),
+            _ => panic!("expected a flat term"),
+        }
+    }
+}
