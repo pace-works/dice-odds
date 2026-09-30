@@ -47,6 +47,13 @@ $ diceodds "1d20" --at-least 15
 P(total >= 15) = 30.0000%
 ```
 
+Roll four dice and keep the best three:
+
+```
+$ diceodds "4d6kh3" --exact 18
+P(total == 18) = 1.6204%
+```
+
 Subtraction works too, as its own signed term:
 
 ```
@@ -73,13 +80,19 @@ $ diceodds "2D6 + 3" --lenient
 ## Notation supported
 
 - `NdS`: roll N dice with S sides each and sum them.
+- `NdSkhK` keeps the highest K dice and `NdSklK` keeps the lowest K, so
+  `4d6kh3` is the usual ability score roll and `2d20kl1` is
+  disadvantage. K must be between 1 and N. Because kept dice depend on
+  each other, these terms are computed differently and have a tighter
+  size limit than plain dice; oversized ones are rejected with an error.
 - A bare number is a flat modifier.
 - Terms are combined with `+` and `-`, e.g. `2d6+1d4-2`.
 - Strict mode requires: no whitespace, lowercase `d`, an explicit count
   before `d` (`1d6`, not `d6`), no leading zeros, and an explicit `+` or
-  `-` before every term after the first.
-- `--lenient` relaxes all of the above: whitespace is stripped, `D` is
-  accepted, a missing count defaults to 1, and leading zeros are allowed.
+  `-` before every term after the first, and a count after `kh`/`kl`.
+- `--lenient` relaxes all of the above: whitespace is stripped, `D`, `KH`
+  and `KL` are accepted, a missing dice count or keep count defaults to 1,
+  and leading zeros are allowed.
 - Regardless of mode, an expression is capped at 32 terms, 500 dice
   total, and 1000 sides per die, to keep the computation exact and fast.
 

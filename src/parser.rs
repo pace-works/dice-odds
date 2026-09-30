@@ -10,6 +10,9 @@ use std::fmt;
 const MAX_TERMS: usize = 32;
 const MAX_TOTAL_DICE: u32 = 500;
 const MAX_SIDES: u32 = 1000;
+// Keep-highest/lowest is computed by a DP whose cost grows as
+// count^2 * sides^2 * keep, so it gets its own, much tighter, ceiling.
+const MAX_KEEP_WORK: u64 = 50_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sign {
@@ -17,9 +20,19 @@ pub enum Sign {
     Minus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    Highest(u32),
+    Lowest(u32),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TermKind {
-    Dice { count: u32, sides: u32 },
+    Dice {
+        count: u32,
+        sides: u32,
+        keep: Option<Keep>,
+    },
     Flat(u32),
 }
 
@@ -49,6 +62,11 @@ pub enum ParseError {
     TooManyTerms(usize),
     TooManyDice(u32),
     TooManySides(u32),
+    BadKeep(String),
+    MissingKeepCount(String),
+    ZeroKeep(String),
+    KeepExceedsCount(String),
+    KeepTooExpensive(String),
 }
 
 impl fmt::Display for ParseError {
@@ -80,6 +98,19 @@ impl fmt::Display for ParseError {
             }
             ParseError::TooManySides(n) => {
                 write!(f, "a die with {n} sides exceeds the limit of {MAX_SIDES}")
+            }
+            ParseError::BadKeep(tok) => {
+                write!(f, "'{tok}' has an unrecognized modifier, expected 'kh' or 'kl' and a count")
+            }
+            ParseError::MissingKeepCount(tok) => {
+                write!(f, "'{tok}' is missing a count after 'kh' or 'kl' (use --lenient to default to 1)")
+            }
+            ParseError::ZeroKeep(tok) => write!(f, "'{tok}' keeps zero dice"),
+            ParseError::KeepExceedsCount(tok) => {
+                write!(f, "'{tok}' keeps more dice than it rolls")
+            }
+            ParseError::KeepTooExpensive(tok) => {
+                write!(f, "'{tok}' is too large to compute with a keep modifier, use fewer dice or sides")
             }
         }
     }
@@ -176,7 +207,17 @@ fn parse_term(token: &str, sign: Sign, lenient: bool) -> Result<Term, ParseError
     match d_pos {
         Some(pos) => {
             let count_str = &token[..pos];
-            let sides_str = &token[pos + 1..];
+            let after_d = &token[pos + 1..];
+
+            let k_pos = if lenient {
+                after_d.find(|c| c == 'k' || c == 'K')
+            } else {
+                after_d.find('k')
+            };
+            let (sides_str, keep_str) = match k_pos {
+                Some(k) => (&after_d[..k], Some(&after_d[k + 1..])),
+                None => (after_d, None),
+            };
 
             let count = if count_str.is_empty() {
                 if lenient {
@@ -203,9 +244,26 @@ fn parse_term(token: &str, sign: Sign, lenient: bool) -> Result<Term, ParseError
                 return Err(ParseError::TooManySides(sides));
             }
 
+            let keep = match keep_str {
+                Some(s) => Some(parse_keep(s, token, lenient)?),
+                None => None,
+            };
+            if let Some(Keep::Highest(n) | Keep::Lowest(n)) = keep {
+                if n == 0 {
+                    return Err(ParseError::ZeroKeep(token.to_string()));
+                }
+                if n > count {
+                    return Err(ParseError::KeepExceedsCount(token.to_string()));
+                }
+                let work = (count as u64).pow(2) * (sides as u64).pow(2) * n as u64;
+                if work > MAX_KEEP_WORK {
+                    return Err(ParseError::KeepTooExpensive(token.to_string()));
+                }
+            }
+
             Ok(Term {
                 sign,
-                kind: TermKind::Dice { count, sides },
+                kind: TermKind::Dice { count, sides, keep },
             })
         }
         None => {
@@ -216,6 +274,29 @@ fn parse_term(token: &str, sign: Sign, lenient: bool) -> Result<Term, ParseError
             })
         }
     }
+}
+
+// `spec` is what follows the 'k', e.g. "h3" or "l".
+fn parse_keep(spec: &str, token: &str, lenient: bool) -> Result<Keep, ParseError> {
+    let mut chars = spec.chars();
+    let highest = match chars.next() {
+        Some('h') => true,
+        Some('l') => false,
+        Some('H') if lenient => true,
+        Some('L') if lenient => false,
+        _ => return Err(ParseError::BadKeep(token.to_string())),
+    };
+    let digits = chars.as_str();
+    let n = if digits.is_empty() {
+        if lenient {
+            1
+        } else {
+            return Err(ParseError::MissingKeepCount(token.to_string()));
+        }
+    } else {
+        parse_number(digits, lenient)?
+    };
+    Ok(if highest { Keep::Highest(n) } else { Keep::Lowest(n) })
 }
 
 fn parse_number(s: &str, lenient: bool) -> Result<u32, ParseError> {
@@ -236,7 +317,7 @@ mod tests {
         expr.terms
             .iter()
             .map(|t| match t.kind {
-                TermKind::Dice { count, sides } => (t.sign, count, sides),
+                TermKind::Dice { count, sides, .. } => (t.sign, count, sides),
                 TermKind::Flat(_) => panic!("expected a dice term"),
             })
             .collect()
@@ -406,6 +487,83 @@ mod tests {
     fn accepts_terms_at_limit() {
         let expr = (0..32).map(|_| "1d6").collect::<Vec<_>>().join("+");
         assert!(parse(&expr, false).is_ok());
+    }
+
+    fn keep_of(input: &str, lenient: bool) -> Option<Keep> {
+        match parse(input, lenient).unwrap().terms[0].kind {
+            TermKind::Dice { keep, .. } => keep,
+            TermKind::Flat(_) => panic!("expected a dice term"),
+        }
+    }
+
+    #[test]
+    fn parses_keep_highest() {
+        assert_eq!(keep_of("4d6kh3", false), Some(Keep::Highest(3)));
+    }
+
+    #[test]
+    fn parses_keep_lowest() {
+        assert_eq!(keep_of("2d20kl1", false), Some(Keep::Lowest(1)));
+    }
+
+    #[test]
+    fn plain_dice_have_no_keep() {
+        assert_eq!(keep_of("4d6", false), None);
+    }
+
+    #[test]
+    fn keep_combines_with_other_terms() {
+        let expr = parse("4d6kh3+2", false).unwrap();
+        assert_eq!(expr.terms.len(), 2);
+    }
+
+    #[test]
+    fn strict_mode_requires_keep_count() {
+        assert!(matches!(
+            parse("4d6kh", false),
+            Err(ParseError::MissingKeepCount(_))
+        ));
+    }
+
+    #[test]
+    fn lenient_mode_defaults_keep_count_to_one() {
+        assert_eq!(keep_of("4d6kh", true), Some(Keep::Highest(1)));
+    }
+
+    #[test]
+    fn strict_mode_rejects_uppercase_keep() {
+        assert!(parse("4d6KH3", false).is_err());
+    }
+
+    #[test]
+    fn lenient_mode_accepts_uppercase_keep() {
+        assert_eq!(keep_of("4D6KL2", true), Some(Keep::Lowest(2)));
+    }
+
+    #[test]
+    fn rejects_unknown_keep_modifier() {
+        assert!(matches!(parse("4d6kx3", false), Err(ParseError::BadKeep(_))));
+    }
+
+    #[test]
+    fn rejects_zero_keep() {
+        assert!(matches!(parse("4d6kh0", false), Err(ParseError::ZeroKeep(_))));
+    }
+
+    #[test]
+    fn rejects_keep_larger_than_count() {
+        assert!(matches!(
+            parse("4d6kh5", false),
+            Err(ParseError::KeepExceedsCount(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_keep_pool() {
+        assert!(matches!(
+            parse("500d1000kh250", false),
+            Err(ParseError::KeepTooExpensive(_))
+        ));
     }
 
     #[test]
